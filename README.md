@@ -26,6 +26,8 @@ shitman.py --verify game.bigpimg game.cue           # Verify against source BIN/
 shitman.py --compare ours.bigpimg reference.bigpimg  # Binary comparison of two files
 ```
 
+Precompiled executables are provided for your convenience, so if you use those, take into account the name of the executable.
+
 ## Options
 
 | Flag | Description |
