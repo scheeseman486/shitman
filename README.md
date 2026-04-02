@@ -1,6 +1,6 @@
 # SHITMAN
 
-A slop coded Atari Jaguar CD disc image converter that converts bin/cue to BigPEmu's `.bigpimg` compressed format. BigPEmu doesn't support CHD so without a CHDMAN equivalent I needed a standalone coverter, so here it is. Thanks SHITMAN!
+A slop coded Atari Jaguar CD disc image converter that converts bin/cue to BigPEmu's `.bigpimg` compressed format. BigPEmu doesn't support CHD so without a CHDMAN equivalent I needed a standalone converter, so here it is. Thanks SHITMAN!
 
 ## Requirements
 
