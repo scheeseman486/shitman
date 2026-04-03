@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# ── Version ───────────────────────────────────────────────────────────────────
+
+VERSION = '0.69.420'
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 BIGPIMG_MAGIC = b'\x35\x71\x17\xd7\x7c\xf4\x19\x58'
@@ -697,6 +701,8 @@ def compare_shitman(our_path: str, ref_path: str, verbose: bool = False):
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    print(f'SHITMAN - Convert Atari Jaguar CD images to BigPImage format - {VERSION}')
+
     parser = argparse.ArgumentParser(
         description='SHITMAN - Convert Atari Jaguar CD images to BigPImage format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
