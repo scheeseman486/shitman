@@ -36,9 +36,120 @@ FLAGS_SUBCHANNEL = 3
 # Per-track sector_size in subchannel mode: main_size | (sub_size << 16)
 TRACK_SECTOR_SIZE_SUB = SECTOR_SIZE_RAW | (SUBCHANNEL_SIZE << 16)  # 0x00600930
 # Subchannel fill patterns
-SUB_FILL_GAP = b'\x80' * SUBCHANNEL_SIZE       # Gap/lead-in sectors
-SUB_FILL_DATA = (b'\x00' * 6 + b'\x40' + b'\x00' * 5) * 8  # Data sectors
+SUB_FILL_GAP = b'\x80' * SUBCHANNEL_SIZE       # Gap/lead-in/lead-out sectors (P=1)
 DEFLATE_LEVEL = 9              # Best compression (closest to BigPEmu output)
+
+
+# ── Subchannel Q-Channel Helpers ─────────────────────────────────────────────
+
+def int_to_bcd(n: int) -> int:
+    """Convert integer (0–99) to BCD byte."""
+    return ((n // 10) << 4) | (n % 10)
+
+
+def lba_to_msf(lba: int) -> tuple:
+    """Convert LBA to (minutes, seconds, frames) tuple."""
+    f = lba % 75
+    s = (lba // 75) % 60
+    m = lba // (75 * 60)
+    return m, s, f
+
+
+def crc16_q(data: bytes) -> int:
+    """CRC-16-CCITT for Q-channel: poly=0x1021, init=0x0000, final XOR=0xFFFF."""
+    crc = 0x0000
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc ^ 0xFFFF
+
+
+def build_subchannel(track_num: int, session_index: int,
+                     rel_lba: int, abs_lba: int) -> bytes:
+    """Build 96-byte bit-interleaved subchannel data with Q-channel timing.
+
+    Q-channel layout (12 bytes):
+      ctrl/adr=0x01, TNO=BCD(track), IDX=BCD(session+1),
+      rel_M:S:F (BCD), 0x00, abs_M:S:F (BCD), CRC-16 (big-endian)
+
+    Bit interleaving: Q data goes into bit 6 of each subchannel byte.
+    P channel = 0 for data sectors. R-W channels = 0.
+    """
+    rm, rs, rf = lba_to_msf(abs(rel_lba))
+    am, a_s, af = lba_to_msf(abs_lba)
+
+    q_data = bytes([
+        0x01,                          # ctrl/adr
+        int_to_bcd(track_num),         # TNO
+        int_to_bcd(session_index + 1), # IDX (session-based)
+        int_to_bcd(rm),               # relative minute
+        int_to_bcd(rs),               # relative second
+        int_to_bcd(rf),               # relative frame
+        0x00,                          # zero
+        int_to_bcd(am),               # absolute minute
+        int_to_bcd(a_s),              # absolute second
+        int_to_bcd(af),               # absolute frame
+    ])
+    crc = crc16_q(q_data)
+    q_bytes = q_data + struct.pack('>H', crc)
+
+    # Bit-interleave Q channel into 96-byte subchannel
+    sub = bytearray(SUBCHANNEL_SIZE)
+    for i in range(96):
+        byte_idx = i >> 3        # i // 8
+        bit_idx = 7 - (i & 7)   # 7 - (i % 8)
+        if q_bytes[byte_idx] & (1 << bit_idx):
+            sub[i] = 0x40        # bit 6 = Q channel
+    return bytes(sub)
+
+
+def find_track_for_lba(lba: int, layout) -> 'DiscTrack | None':
+    """Find the track whose BIN data covers this LBA, or None for gap sectors."""
+    for track in layout.tracks:
+        if track.data_start_lba <= lba < track.data_start_lba + track.sector_count:
+            return track
+    return None
+
+
+def compute_sector_regions(layout) -> list:
+    """Compute LBA regions for subchannel type determination.
+
+    Returns list of (start_lba, end_lba, region_type, track_or_none).
+    Region types: 'pregap', 'intersession', 'data', 'leadout'.
+    """
+    regions = []
+    current = 0
+
+    # Initial pregap (150 sectors)
+    regions.append((0, PREGAP_SECTORS, 'pregap', None))
+    current = PREGAP_SECTORS
+
+    for si in range(len(layout.sessions)):
+        session_tracks = [t for t in layout.tracks if t.session_index == si]
+
+        if si > 0:
+            regions.append((current, current + INTERSESSION_GAP, 'intersession', None))
+            current += INTERSESSION_GAP
+
+        for track in session_tracks:
+            if current < track.data_start_lba:
+                regions.append((current, track.data_start_lba, 'pregap', None))
+            regions.append((
+                track.data_start_lba,
+                track.data_start_lba + track.sector_count,
+                'data', track
+            ))
+            current = track.data_start_lba + track.sector_count
+
+    # Lead-out
+    if current < layout.total_sectors:
+        regions.append((current, layout.total_sectors, 'leadout', None))
+
+    return regions
 
 
 # ── CUE/BIN Parsing ─────────────────────────────────────────────────────────
@@ -403,13 +514,20 @@ def encode_shitman(cue_path: str, output_path: str,
             else:
                 sector_hashes[h] = [raw, 1, [lba]]
 
-        # Collect duplicates — only sectors appearing 3+ times are worth
-        # the dictionary overhead (matches BigPEmu's observed behavior)
-        for h, (content, count, lbas) in sector_hashes.items():
-            if count >= 3:
-                idx = len(dict_entries)
-                dict_entries.append(content)
-                dict_map[h] = idx
+        # Collect duplicates — only sectors appearing more than 10 times
+        # qualify for the dictionary (matches BigPEmu's fixed threshold of
+        # count > 10, confirmed via disassembly: cmp count, 0xA at 0x670AE0).
+        # Max 256 entries: index encoding uses 8 bits (bits 14-7 of u16).
+        # Prioritize sectors with the most duplicates for best compression.
+        candidates = [(count, h, content, lbas) for h, (content, count, lbas)
+                       in sector_hashes.items() if count > 10]
+        candidates.sort(reverse=True)
+        for count, h, content, lbas in candidates[:256]:
+            idx = len(dict_entries)
+            # Dictionary entries are always raw sector data (2352 bytes),
+            # even in subchannel mode — subchannel is NOT stored in dict.
+            dict_entries.append(content)
+            dict_map[h] = idx
 
         dict_entry_count = len(dict_entries)
         if dict_entry_count > 0:
@@ -420,15 +538,45 @@ def encode_shitman(cue_path: str, output_path: str,
                 print(f"  Dictionary: {dict_entry_count} entries, "
                       f"{len(dict_raw)} -> {len(dict_compressed)} bytes")
 
+    # Compute sector regions for subchannel type determination
+    if subchannel:
+        regions = compute_sector_regions(layout)
+        region_idx = 0
+        last_data_sub = SUB_FILL_GAP  # Frozen for lead-out sectors
+
     # Main compression pass
     for lba in range(layout.total_sectors):
         raw = reader.read_sector(lba)
 
+        # Determine subchannel data for this sector
+        if subchannel:
+            # Advance region pointer
+            while region_idx < len(regions) - 1 and lba >= regions[region_idx][1]:
+                region_idx += 1
+            _, _, rtype, rtrack = regions[region_idx]
+
+            if rtype == 'pregap':
+                sub_data = SUB_FILL_GAP
+            elif rtype == 'intersession':
+                sub_data = SUB_FILL_GAP
+            elif rtype == 'leadout':
+                sub_data = last_data_sub
+            elif rtype == 'data':
+                if lba < rtrack.start_lba:
+                    # Pregap sector (before INDEX 01) — uses gap pattern
+                    sub_data = SUB_FILL_GAP
+                else:
+                    rel_lba = lba - rtrack.start_lba
+                    sub_data = build_subchannel(rtrack.number, rtrack.session_index,
+                                                rel_lba, lba)
+                    last_data_sub = sub_data
+            else:
+                sub_data = SUB_FILL_GAP
+
         if raw is None:
-            # Gap sector
+            # Gap sector (pregap, inter-session, or lead-out)
             if subchannel:
-                # Store gap sector: zeros + gap subchannel pattern (0x80)
-                sub_sector = b'\x00' * SECTOR_SIZE_RAW + SUB_FILL_GAP
+                sub_sector = b'\x00' * SECTOR_SIZE_RAW + sub_data
                 compressed = compress_sector(sub_sector, compression_level)
                 sector_index.append(len(compressed))
                 compressed_data.append(compressed)
@@ -437,9 +585,9 @@ def encode_shitman(cue_path: str, output_path: str,
             continue
 
         if raw == zero_sector:
-            # All-zero data sector
+            # All-zero data sector (still has subchannel timing data)
             if subchannel:
-                sub_sector = raw + SUB_FILL_DATA
+                sub_sector = raw + sub_data
                 compressed = compress_sector(sub_sector, compression_level)
                 sector_index.append(len(compressed))
                 compressed_data.append(compressed)
@@ -452,14 +600,22 @@ def encode_shitman(cue_path: str, output_path: str,
             h = hash(raw)
             if h in dict_map:
                 dict_idx = dict_map[h]
-                ref = 0x8000 | (dict_idx << 7)
-                sector_index.append(ref)
+                if subchannel:
+                    # In subchannel mode, dict refs store compressed subchannel
+                    # separately. Entry: bit15=1, bits14-7=dict_idx, bits6-0=sub_comp_size
+                    sub_comp = compress_sector(sub_data, compression_level)
+                    sub_comp_size = len(sub_comp)
+                    ref = 0x8000 | (dict_idx << 7) | sub_comp_size
+                    sector_index.append(ref)
+                    compressed_data.append(sub_comp)
+                else:
+                    ref = 0x8000 | (dict_idx << 7)
+                    sector_index.append(ref)
                 continue
 
         # Regular compression
         if subchannel:
-            # Append synthetic subchannel data pattern
-            raw = raw + SUB_FILL_DATA
+            raw = raw + sub_data
 
         compressed = compress_sector(raw, compression_level)
 
@@ -574,8 +730,9 @@ def verify_shitman(bigpimg_path: str, cue_path: str, verbose: bool = False):
     if dict_count > 0 and dict_comp_size > 0:
         dict_compressed = img[table_end:table_end + dict_comp_size]
         dict_raw = zlib.decompress(dict_compressed, -15)
+        # Dict entries are always 2352 bytes (raw sector, no subchannel)
         for i in range(dict_count):
-            dict_sectors.append(dict_raw[i * sector_size:(i + 1) * sector_size])
+            dict_sectors.append(dict_raw[i * SECTOR_SIZE_RAW:(i + 1) * SECTOR_SIZE_RAW])
         data_start = table_end + dict_comp_size
 
     # Verify each stored sector
@@ -598,7 +755,11 @@ def verify_shitman(bigpimg_path: str, cue_path: str, verbose: bool = False):
 
         if entry & 0x8000:
             # Dictionary reference
-            dict_idx = (entry & 0x7F80) >> 7
+            dict_idx = (entry >> 7) & 0xFF
+            sub_comp_size = entry & 0x7F
+            # In subchannel mode, skip compressed subchannel data in the stream
+            if sub_comp_size > 0:
+                offset += sub_comp_size
             expected = dict_sectors[dict_idx][:SECTOR_SIZE_RAW]
             if raw != expected:
                 if verbose:

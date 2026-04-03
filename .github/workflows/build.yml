@@ -33,6 +33,17 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Stamp version from tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER="$(git describe --tags --always 2>/dev/null || echo dev)"
+          fi
+          sed -i "s/^VERSION = .*/VERSION = '${VER}'/" shitman.py
+          echo "VERSION=${VER}" >> "$GITHUB_ENV"
+
       - name: Install PyInstaller
         run: pip install pyinstaller
 

@@ -75,7 +75,11 @@ through total_sectors - 1).
     ------------------  -----------------------------------------------------------
     0xFFFF              Zero-filled gap. Not stored; reader emits sector_size zeros.
     Bit 15 set,         Dictionary reference. Bits 14-7 encode the 0-based dictionary
-    not 0xFFFF          sector index. Bits 6-0 are reserved (zero).
+    not 0xFFFF          sector index. In subchannel mode (flags == 3), bits 6-0 encode
+                        the compressed size of the per-sector subchannel data stored
+                        separately in the data stream (since the dictionary stores raw
+                        sector data only, without subchannel). In non-subchannel mode,
+                        bits 6-0 are zero.
     Other               Compressed size in bytes of the sector's raw DEFLATE payload
                         in the data stream. 0 means stored uncompressed at full
                         sector_size.
@@ -87,10 +91,10 @@ Present only when dict_entry_count > 0 in the header. Immediately follows the se
 index table.
 
 The dictionary is a single raw DEFLATE stream of dict_compressed_size bytes. It
-decompresses to dict_entry_count * sector_size bytes: a flat concatenation of template
-sectors.
+decompresses to dict_entry_count * 2352 bytes: a flat concatenation of template sectors
+(raw sector data only, without subchannel data even in subchannel mode).
 
-Template sectors are sectors whose content appears three or more times across the disc.
+Template sectors are sectors whose raw content appears more than 10 times across the disc.
 All duplicate instances reference the dictionary entry via the sector index instead of
 storing their own compressed copy. The maximum dictionary index is 255 (8 bits in the
 index entry, bits 14-7).
@@ -102,8 +106,10 @@ Follows the dictionary (or the sector index if no dictionary). Contains concaten
 DEFLATE streams in LBA order, one per stored sector. Each decompresses to exactly
 sector_size bytes.
 
-Sectors whose index entry is 0xFFFF (gap/zero) or has bit 15 set (dictionary reference)
-are not present in this region.
+Sectors whose index entry is 0xFFFF (gap/zero) are not present in this region.
+Dictionary reference sectors (bit 15 set) store only their compressed subchannel data
+here (if in subchannel mode and bits 6-0 > 0); the main sector data comes from the
+dictionary.
 
 Sectors whose index entry is 0 are stored uncompressed at sector_size bytes.
 

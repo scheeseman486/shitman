@@ -47,7 +47,7 @@ SHITMAN parses the CUE sheet to determine disc geometry (sessions, tracks, prega
 
 The `--prepass` option does a first pass over all sectors to identify content that appears three or more times, storing those as dictionary entries that are referenced by index rather than compressed repeatedly.
 
-See `SPEC.md` for the full BigPImage format specification (reverse-engineered from BigPEmu). No guarantees on accuracy, but for what it's worth, the code in shitman.py results in 1:1 versions compared to the original executable (as far as I can tell through testing).
+See `SPEC.md` for the full BigPImage format specification (reverse-engineered from BigPEmu). No guarantees on accuracy, but for what it's worth, the code in shitman.py results in functionally 1:1 versions compared to the original executable (with some minor differences due to different zlib versions, as far as I can tell through testing).
 
 ## License
 
